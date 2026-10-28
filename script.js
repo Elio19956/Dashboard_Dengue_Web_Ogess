@@ -144,7 +144,7 @@ async function cargarDatosCSV(esActualizacionAutomatica = false) {
                 return;
             }
 
-            datosOriginales = registros;
+            datosOriginales = quitarDuplicados(registros);
             mapaDniInspector = null;
             ultimaCargaCSV = Date.now();
 
@@ -159,6 +159,153 @@ async function cargarDatosCSV(esActualizacionAutomatica = false) {
             seguro("actualizarDashboard", actualizarDashboard);
         }
     });
+}
+
+// ============================================================
+// QUITAR REGISTROS DUPLICADOS DEL CSV
+// ============================================================
+// La descarga de Dengue-Admin puede traer la misma vivienda en dos filas
+// (ej. ANA KELY 02/10/2026, Mz 309-F Jr. Apurimac Mz E Lote 2), aunque el
+// Formato 03 la muestre una sola vez. Aqui solo se quitan filas identicas
+// en todas sus columnas; los re-registros se tratan en quitarReRegistros().
+function claveRegistroUnico(f) {
+    // Fila identica en todas sus columnas.
+    return Object.keys(f).sort().map(k => k + "=" + texto(f[k])).join("|");
+}
+
+function quitarDuplicados(filas) {
+    const mapa = new Map();
+    const duplicados = [];
+
+    filas.forEach(f => {
+        const clave = claveRegistroUnico(f);
+        const existente = mapa.get(clave);
+
+        if (!existente) {
+            mapa.set(clave, f);
+            return;
+        }
+
+        duplicados.push(f);
+        // Conservar la copia que tenga datos de recuperacion.
+        if (numero(f.recuperada) === 1 && numero(existente.recuperada) !== 1) {
+            mapa.set(clave, f);
+        }
+    });
+
+    if (duplicados.length) {
+        console.warn("Registros duplicados eliminados:", duplicados.length);
+        console.table(duplicados.map(f => ({
+            fecha: texto(f.fecha_creacion) || texto(f.fecha_inspeccion),
+            inspector: texto(f.nombre_inspector),
+            localidad: texto(f.localidad_eess),
+            sector: texto(f.sector),
+            manzana: texto(f.codigo_manzana),
+            direccion: texto(f.direccion)
+        })));
+    }
+
+    return quitarReRegistros([...mapa.values()]);
+}
+
+// Re-registros: el inspector registra una vivienda y luego la vuelve a
+// registrar corregida (ej. ANA KELY 02/10: 309-F "JR APRURIMAC MZ E LOTE 2" ->
+// "JR APURIMAC MZ E LOTE 2"; 296 "JR / LOTE LIBRE" -> "JR IQUITOS / LOTE LIBRE").
+// Dengue-Admin muestra solo la ultima, pero su exportacion trae ambas.
+// Es la misma vivienda si coinciden jornada + manzana + GPS exacto + condicion
+// + tipo, Y ADEMAS la direccion es compatible:
+//   - con numeros: los mismos numeros (369 vs 340 = casas distintas, aunque
+//     el GPS sea igual: ERICKA 17/09 Nueve de Abril, Mz 17);
+//   - sin numeros: las palabras de una estan todas contenidas en la otra.
+// Se conserva la mas reciente. Validado contra Formato 03:
+//   Morales 01-02/10 = 373 / 63 / 104 ; Nueve de Abril 17-19/09 = 358 / 75 / 124.
+
+function numerosDireccion(valor) {
+    return [...new Set(texto(valor).match(/\d+/g) || [])]
+        .map(n => String(Number(n))).sort().join(",");
+}
+
+function palabrasDireccion(valor) {
+    return new Set(
+        texto(valor).toUpperCase()
+            .normalize("NFD").replace(/[\u0300-\u036f]/g, "")
+            .split(/[^A-Z0-9]+/).filter(Boolean)
+    );
+}
+
+function mismaDireccion(a, b) {
+    // Llamada solo con los mismos numeros (son parte de la clave).
+    if (numerosDireccion(a)) return true;
+    const pa = palabrasDireccion(a), pb = palabrasDireccion(b);
+    const [menor, mayor] = pa.size <= pb.size ? [pa, pb] : [pb, pa];
+    return [...menor].every(w => mayor.has(w));
+}
+
+// obtenerFecha() descarta la hora; aqui se necesita la hora exacta.
+function marcaTiempoRegistro(f) {
+    const v = texto(f.fecha_creacion) || texto(f._createdAt_y) || texto(f.fecha_inspeccion);
+    let m = v.match(/^(\d{4})[\/\-](\d{1,2})[\/\-](\d{1,2})[ T](\d{1,2}):(\d{2})(?::(\d{2}))?/);
+    if (m) return new Date(+m[1], +m[2] - 1, +m[3], +m[4], +m[5], +(m[6] || 0)).getTime();
+    m = v.match(/^(\d{1,2})[\/\-](\d{1,2})[\/\-](\d{4})[ T](\d{1,2}):(\d{2})(?::(\d{2}))?/);
+    if (m) return new Date(+m[3], +m[2] - 1, +m[1], +m[4], +m[5], +(m[6] || 0)).getTime();
+    return null; // sin hora: no se puede saber si es re-registro
+}
+
+function quitarReRegistros(filas) {
+    const grupos = new Map();
+    const resultado = [];
+    const quitados = [];
+
+    filas.forEach((f, orden) => {
+        const x = texto(f.georeferencia_X), y = texto(f.georeferencia_Y);
+        const jornada = texto(f._uid) || texto(f._id_x);
+        if (!x || !y || !jornada) { resultado.push(f); return; }
+
+        const clave = [
+            jornada,
+            texto(f.codigo_manzana).toUpperCase(),
+            x, y,
+            texto(f.atencion_vivienda_indicador),
+            texto(f.tipoActividadInspeccion).toUpperCase(),
+            numerosDireccion(f.direccion)
+        ].join("|");
+
+        const t = marcaTiempoRegistro(f);
+        if (!grupos.has(clave)) grupos.set(clave, []);
+        grupos.get(clave).push({ f, t: t === null ? -Infinity : t, orden });
+    });
+
+    grupos.forEach(lista => {
+        if (lista.length === 1) { resultado.push(lista[0].f); return; }
+
+        // Del mas antiguo al mas reciente; cada registro reemplaza a una
+        // version anterior compatible de la misma vivienda.
+        lista.sort((a, b) => (a.t - b.t) || (a.orden - b.orden));
+        const casas = [];
+        lista.forEach(reg => {
+            const i = casas.findIndex(c => mismaDireccion(c.f.direccion, reg.f.direccion));
+            if (i === -1) {
+                casas.push(reg);
+            } else {
+                quitados.push({ quitado: casas[i].f, conservado: reg.f });
+                casas[i] = reg;
+            }
+        });
+        casas.forEach(c => resultado.push(c.f));
+    });
+
+    if (quitados.length) {
+        console.warn("Re-registros eliminados (misma jornada + manzana + GPS + direccion):", quitados.length);
+        console.table(quitados.map(q => ({
+            inspector: texto(q.quitado.nombre_inspector),
+            localidad: texto(q.quitado.localidad_eess),
+            manzana: texto(q.quitado.codigo_manzana),
+            quitado: texto(q.quitado.direccion),
+            conservado: texto(q.conservado.direccion)
+        })));
+    }
+
+    return resultado;
 }
 
 // ============================================================
@@ -178,9 +325,9 @@ function seguro(nombre, fn) {
 // ============================================================
 
 function procesarDatos(datos) {
-    datosOriginales = (datos || []).filter(
+    datosOriginales = quitarDuplicados((datos || []).filter(
         fila => fila && Object.keys(fila).length > 1
-    );
+    ));
 
     datosFiltrados = [...datosOriginales];
 
@@ -1487,27 +1634,51 @@ function direccionJefeFamilia(fila) {
     return texto(fila.direccion) + " / /" + familia;
 }
 
+// "SECTOR 3", "03" o "3" -> 3 (sin numero: se deja el texto y va al final).
+function numeroSector(valor) {
+    const m = texto(valor).match(/\d+/);
+    return m ? Number(m[0]) : Number.MAX_SAFE_INTEGER;
+}
+
+function sectorParaFormato(valor) {
+    const n = numeroSector(valor);
+    return n === Number.MAX_SAFE_INTEGER ? texto(valor) : n;
+}
+
+function compararTexto(a, b) {
+    return a < b ? -1 : (a > b ? 1 : 0);
+}
+
+function tituloLocalidad(valor) {
+    return nombrePropio(valor).replace(/ (De|Del|La|Las|Los|Y) /g, m => m.toLowerCase());
+}
+
 function filasLecturaMuestras() {
     const filas = [];
+    const casaDeFila = []; // a que vivienda pertenece cada fila (para colorear)
 
+    // Orden: localidad > sector > inspector > fecha > manzana > direccion.
     obtenerDatosParaDescarga()
         .filter(viviendaPositiva)
         .sort((a, b) =>
-            texto(a.fecha_inspeccion).slice(0, 10).localeCompare(texto(b.fecha_inspeccion).slice(0, 10)) ||
-            texto(a.localidad_eess).localeCompare(texto(b.localidad_eess)) ||
-            (numero(a.sector) - numero(b.sector)) ||
+            compararTexto(texto(a.localidad_eess), texto(b.localidad_eess)) ||
+            (numeroSector(a.sector) - numeroSector(b.sector)) ||
+            compararTexto(texto(a.nombre_inspector), texto(b.nombre_inspector)) ||
+            compararTexto(texto(a.fecha_inspeccion).slice(0, 10), texto(b.fecha_inspeccion).slice(0, 10)) ||
             (numero(a.codigo_manzana) - numero(b.codigo_manzana)) ||
-            texto(a.direccion).localeCompare(texto(b.direccion))
+            compararTexto(texto(a.codigo_manzana), texto(b.codigo_manzana)) ||
+            compararTexto(texto(a.direccion), texto(b.direccion))
         )
-        .forEach(fila => {
+        .forEach((fila, indiceCasa) => {
             CODIGOS_CRIADERO_POSITIVO.forEach(([campo, codigo]) => {
                 const cantidad = Math.floor(Math.max(0, numero(fila[campo])));
                 for (let i = 0; i < cantidad; i++) {
+                    casaDeFila.push(indiceCasa);
                     filas.push([
                         filas.length + 1,
                         nombrePropio(fila.distrito),
                         nombrePropio(fila.localidad_eess),
-                        valorNumeroOTexto(fila.sector),
+                        sectorParaFormato(fila.sector),
                         fechaExcel(fila.fecha_inspeccion),
                         valorNumeroOTexto(fila.codigo_manzana),
                         direccionJefeFamilia(fila),
@@ -1519,6 +1690,7 @@ function filasLecturaMuestras() {
             });
         });
 
+    filas.casa = casaDeFila;
     return filas;
 }
 
@@ -1536,13 +1708,13 @@ function descargarPositivos() {
 
         hoja.columns = [
             { width: 6 }, { width: 14 }, { width: 22 }, { width: 9 },
-            { width: 12 }, { width: 8 }, { width: 58 }, { width: 36 },
+            { width: 12 }, { width: 8 }, { width: 40 }, { width: 36 },
             { width: 7 }, { width: 5 }, { width: 5 }, { width: 5 },
             { width: 10 }, { width: 9 }
         ];
 
-        const distritos = [...new Set(filas.map(f => f[1]).filter(Boolean))];
-        const subtitulo = (distritos.length === 1 ? distritos[0] + " - " : "") +
+        const localidades = [...new Set(filas.map(f => f[2]).filter(Boolean))];
+        const subtitulo = (localidades.length === 1 ? tituloLocalidad(localidades[0]) + " - " : "") +
             "Vigilancia Entomológicas";
 
         const borde = {
@@ -1574,8 +1746,32 @@ function descargarPositivos() {
             celda.border = borde;
         });
 
-        filas.forEach(valores => {
+        // Viviendas con 2 o mas criaderos: mismo color de fondo (columnas A-I),
+        // rotando colores para que dos casas seguidas no se confundan.
+        const COLORES_CASA = [
+            "FFD9D9D9", "FFDDEBF7", "FFFCE4D6", "FFE2EFDA", "FFFFF2CC",
+            "FFE4DFEC", "FFC6E0B4", "FFF8CBAD", "FFBDD7EE", "FFFFE699"
+        ];
+        const filasPorCasa = {};
+        filas.casa.forEach(c => { filasPorCasa[c] = (filasPorCasa[c] || 0) + 1; });
+        const colorDeCasa = {};
+        let siguienteColor = 0;
+
+        filas.forEach((valores, idx) => {
             const r = hoja.addRow(valores);
+            const casa = filas.casa[idx];
+            if (filasPorCasa[casa] > 1) {
+                if (!(casa in colorDeCasa)) {
+                    colorDeCasa[casa] = COLORES_CASA[siguienteColor % COLORES_CASA.length];
+                    siguienteColor++;
+                }
+                for (let c = 1; c <= 9; c++) {
+                    r.getCell(c).fill = {
+                        type: "pattern", pattern: "solid",
+                        fgColor: { argb: colorDeCasa[casa] }
+                    };
+                }
+            }
             for (let c = 1; c <= 14; c++) {
                 const celda = r.getCell(c);
                 celda.border = borde;
